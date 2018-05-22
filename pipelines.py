@@ -37,6 +37,7 @@ def main(config, train_mode):
 def feature_extraction(config, train_mode, **kwargs):
     if train_mode:
         is_missing, is_missing_valid = _is_missing_features(config, train_mode, **kwargs)
+
         cleaned, cleaned_valid = _clean_features(config, train_mode)
 
         dataframe_features_train, dataframe_features_valid = dataframe_features(
@@ -113,7 +114,9 @@ def dataframe_features(clean_features, config, train_mode, **kwargs):
             config, train_mode, **kwargs)
 
         groupby_aggregation, groupby_aggregation_valid = _groupby_aggregations(
-            (clean, clean_valid), (timestamp_features, timestamp_features_valid),
+            (clean, clean_valid),
+            (timestamp_features, timestamp_features_valid),
+            (periods, periods_valid),
             config, train_mode, **kwargs)
         target_encoder, target_encoder_valid = _target_encoders((clean, clean_valid),
                                                                 config, train_mode, **kwargs)
@@ -121,12 +124,14 @@ def dataframe_features(clean_features, config, train_mode, **kwargs):
                           timestamp_features,
                           numerical_features,
                           groupby_aggregation,
-                          target_encoder)
+                          target_encoder,
+                          periods)
         valid_features = (encoded_categorical_valid,
                           timestamp_features_valid,
                           numerical_features_valid,
                           groupby_aggregation_valid,
-                          target_encoder_valid)
+                          target_encoder_valid,
+                          periods_valid)
         return train_features, valid_features
     else:
         clean = clean_features
@@ -134,14 +139,16 @@ def dataframe_features(clean_features, config, train_mode, **kwargs):
         encoded_categorical = _encode_categorical(clean, config, train_mode, **kwargs)
         timestamp_features = _timestamp_features(clean, config, train_mode, **kwargs)
         numerical_features = _numerical_features(clean, config, train_mode, **kwargs)
-        groupby_aggregation = _groupby_aggregations(clean, timestamp_features, config, train_mode, **kwargs)
+        periods = _periods_features(clean, config, train_mode, **kwargs)
+        groupby_aggregation = _groupby_aggregations(clean, timestamp_features, periods, config, train_mode, **kwargs)
         target_encoder = _target_encoders(clean, config, train_mode, **kwargs)
 
         train_features = (encoded_categorical,
                           timestamp_features,
                           numerical_features,
                           groupby_aggregation,
-                          target_encoder)
+                          target_encoder,
+                          periods)
         return train_features
 
 
@@ -501,25 +508,73 @@ def _target_encoders(clean_features, config, train_mode, **kwargs):
         return target_encoder
 
 
-def _groupby_aggregations(clean_features, additional_features, config, train_mode, **kwargs):
+def _periods_features(clean_features, config, train_mode, **kwargs):
     if train_mode:
         clean, clean_valid = clean_features
-        added_feature, added_feature_valid = additional_features
+        target_encoder = Step(name='target_encoder',
+                              transformer=fe.TargetEncoderNSplits(**config.target_encoder),
+                              input_data=['input'],
+                              input_steps=[clean],
+                              adapter={
+                                  'categorical_features': (
+                                      [(clean.name, 'clean_features')], partial(pandas_subset_columns,
+                                                                                cols=cfg.CATEGORICAL_COLUMNS)),
+                                  'target': ([('input', 'y')])
+                              },
+                              cache_dirpath=config.env.cache_dirpath, **kwargs)
+
+        target_encoder_valid = Step(name='target_encoder_valid',
+                                    transformer=target_encoder,
+                                    input_data=['input'],
+                                    input_steps=[clean_valid],
+                                    adapter={'categorical_features': (
+                                        [(clean_valid.name, 'clean_features')], partial(pandas_subset_columns,
+                                                                                        cols=cfg.CATEGORICAL_COLUMNS)),
+                                    },
+                                    cache_dirpath=config.env.cache_dirpath, **kwargs)
+
+        return target_encoder, target_encoder_valid
+
+    else:
+        clean = clean_features
+        target_encoder = Step(name='target_encoder',
+                              transformer=fe.TargetEncoderNSplits(**config.target_encoder),
+                              input_data=['input'],
+                              input_steps=[clean],
+                              adapter={
+                                  'categorical_features': (
+                                      [(clean.name, 'clean_features')], partial(pandas_subset_columns,
+                                                                                cols=cfg.CATEGORICAL_COLUMNS)),
+                              },
+                              cache_dirpath=config.env.cache_dirpath, **kwargs)
+
+        return target_encoder
+
+
+def _groupby_aggregations(clean_features, timestamp_features, periods_features,
+                          config, train_mode, **kwargs):
+    if train_mode:
+        clean, clean_valid = clean_features
+        time, time_valid = timestamp_features
+        periods, periods_valid = periods_features
+
         groupby_aggregations = Step(name='groupby_aggregations',
                                     transformer=fe.GroupbyAggregations(**config.groupby_aggregation),
-                                    input_steps=[clean, added_feature],
+                                    input_steps=[clean, time, periods],
                                     adapter={
                                         'X': ([(clean.name, 'clean_features'),
-                                               (added_feature.name, 'categorical_features')],
+                                               (time.name, 'categorical_features'),
+                                               (periods.name, 'numerical_features')],
                                               pandas_concat_inputs)
                                     },
                                     cache_dirpath=config.env.cache_dirpath, **kwargs)
 
         groupby_aggregations_valid = Step(name='groupby_aggregations_valid',
                                           transformer=groupby_aggregations,
-                                          input_steps=[clean_valid, added_feature_valid],
+                                          input_steps=[clean_valid, time_valid, periods_valid],
                                           adapter={'X': ([(clean_valid.name, 'clean_features'),
-                                                          (added_feature_valid.name, 'categorical_features')],
+                                                          (time_valid.name, 'categorical_features'),
+                                                          (periods_valid.name, 'numerical_features')],
                                                          pandas_concat_inputs
                                                          )
                                                    },
@@ -529,13 +584,15 @@ def _groupby_aggregations(clean_features, additional_features, config, train_mod
 
     else:
         clean = clean_features
-        added_feature = additional_features
+        time = timestamp_features
+        periods = periods_features
         groupby_aggregations = Step(name='groupby_aggregations',
                                     transformer=fe.GroupbyAggregations(**config.groupby_aggregation),
-                                    input_steps=[clean, added_feature],
+                                    input_steps=[clean, time, periods],
                                     adapter={
                                         'X': ([(clean.name, 'clean_features'),
-                                               (added_feature.name, 'categorical_features')],
+                                               (time.name, 'categorical_features'),
+                                               (periods.name, 'numerical_features')],
                                               pandas_concat_inputs)
                                     },
                                     cache_dirpath=config.env.cache_dirpath, **kwargs)
